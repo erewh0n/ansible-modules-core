@@ -72,7 +72,6 @@ TODO
 
 import sys
 import time
-import syslog
 
 try:
     import boto.ec2
@@ -81,10 +80,6 @@ try:
 except ImportError:
     print "failed=True msg='boto required for this module'"
     sys.exit(1)
-
-
-def log(msg, cap=0):
-    syslog.syslog(syslog.LOG_NOTICE|syslog.LOG_DAEMON, msg)
 
 
 def format_response(route_tables):
@@ -144,7 +139,6 @@ def find_matching_route(existing_routes, requested_route, subnet_mapper, gateway
         if route.destination_cidr_block and route.destination_cidr_block != requested_route['dest']:
             continue
 
-        log("Found matching route for requested: %s" % requested_route['dest'])
         return route
     return None
 
@@ -159,17 +153,6 @@ def find_matching_table(existing_tables, requested_table, subnet_mapper, gateway
     for table in existing_tables:
         matched = True
         routes = [route for route in table.routes if route.gateway_id != 'local']
-        log("Existing: route(%s %s %s) assoc(%s %s)" % (
-                routes[0].destination_cidr_block,
-                routes[0].gateway_id, routes[0].instance_id,
-                table.associations[0].subnet_id,
-                subnet_mapper[table.associations[0].subnet_id].cidr_block
-            ))
-        log("Requested: route(%s %s) assoc(%s)" % (
-                requested_table['routes'][0]['dest'],
-                requested_table['routes'][0]['gw'],
-                requested_table['subnets'][0]
-            ))
         if len(requested_table['routes']) != len(routes):
             continue
 
@@ -190,7 +173,6 @@ def find_matching_table(existing_tables, requested_table, subnet_mapper, gateway
         if not matched:
             continue
 
-        log("Returning matched table.")
         return table
     return None
 
@@ -199,6 +181,7 @@ def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
             vpc_id = dict(),
+            vpc_name = dict(),
             route_tables = dict(type='list'),
             state = dict(choices=['present', 'absent'], default='present'),
         )
@@ -213,7 +196,7 @@ def main():
         module.fail_json(msg='route tables need to be a list of dictionaries')
 
     state = module.params.get('state')
-    vpc_id = module.params.get('vpc_id')
+    vpc_name = module.params.get('vpc_name')
     ec2_url, aws_access_key, aws_secret_key, region = get_ec2_creds(module)
    
     if region:
@@ -228,9 +211,18 @@ def main():
     else:
         module.fail_json(msg="VPC region must be specified.")
 
-    vpcs = vpc_conn.get_all_vpcs([vpc_id])
+    vpc_name = module.params.get('vpc_name')
+    vpc_id = module.params.get('vpc_id')
+    if vpc_name and vpc_id:
+        module.fail_json(msg = "Cannot specify both vpc_name and vpc_id.")
+    if vpc_name:
+        vpcs = vpc_conn.get_all_vpcs(filters={'tag:Name':vpc_name})
+    else:
+        vpcs = vpc_conn.get_all_vpcs([vpc_id])
     if vpcs is None or len(vpcs) != 1:
         module.fail_json(msg = "Could not find VPC {0}.".format(vpc_id))
+    if vpc_name:
+        vpc_id = vpcs[0].id
 
     gateways = vpc_conn.get_all_internet_gateways(filters={'attachment.vpc-id': vpcs[0].id})
     if len(gateways) > 1 :
@@ -259,7 +251,6 @@ def main():
             old_tables.remove(matching_table)
         else:
             new_tables.append(requested_table)
-    log("Old tables: %d, new tables: %d" % (len(old_tables), len(new_tables)))
 
     changed = len(old_tables) > 0 or len(new_tables) > 0
 

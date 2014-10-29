@@ -269,7 +269,6 @@ def create_vpc(module, vpc_conn):
     dns_hostnames = module.params.get('dns_hostnames')
     subnets = module.params.get('subnets')
     internet_gateway = module.params.get('internet_gateway')
-    route_tables = module.params.get('route_tables')
     vpc_spec_tags = module.params.get('resource_tags')
     wait = module.params.get('wait')
     wait_timeout = int(module.params.get('wait_timeout'))
@@ -403,99 +402,6 @@ def create_vpc(module, vpc_conn):
             except EC2ResponseError, e:
                 module.fail_json(msg='Unable to delete Internet Gateway, error: {0}'.format(e))
 
-    # Handle route tables - this may be worth splitting into a
-    # different module but should work fine here. The strategy to stay
-    # indempotent is to basically build all the route tables as
-    # defined, track the route table ids, and then run through the
-    # remote list of route tables and delete any that we didn't
-    # create.  This shouldn't interrupt traffic in theory, but is the
-    # only way to really work with route tables over time that I can
-    # think of without using painful aws ids.  Hopefully boto will add
-    # the replace-route-table API to make this smoother and
-    # allow control of the 'main' routing table.
-    if route_tables is not None:
-        if not isinstance(route_tables, list):
-            module.fail_json(msg='route tables need to be a list of dictionaries')
-
-        # Work through each route table and update/create to match dictionary array
-        all_route_tables = []
-        for rt in route_tables:
-            try:
-                new_rt = vpc_conn.create_route_table(vpc.id)
-                for route in rt['routes']:
-                    route_kwargs = {}
-                    if route['gw'] == 'igw':
-                        if not internet_gateway:
-                            module.fail_json(
-                                msg='You asked for an Internet Gateway ' \
-                                '(igw) route, but you have no Internet Gateway'
-                            )
-                        route_kwargs['gateway_id'] = igw.id
-                    elif route['gw'].startswith('i-'):
-                        route_kwargs['instance_id'] = route['gw']
-                    else:
-                        route_kwargs['gateway_id'] = route['gw']
-                    vpc_conn.create_route(new_rt.id, route['dest'], **route_kwargs)
-
-                # Associate with subnets
-                for sn in rt['subnets']:
-                    rsn = vpc_conn.get_all_subnets(filters={'cidr': sn, 'vpc_id': vpc.id })
-                    if len(rsn) != 1:
-                        module.fail_json(
-                            msg='The subnet {0} to associate with route_table {1} ' \
-                            'does not exist, aborting'.format(sn, rt)
-                        )
-                    rsn = rsn[0]
-
-                    # Disassociate then associate since we don't have replace
-                    old_rt = vpc_conn.get_all_route_tables(
-                        filters={'association.subnet_id': rsn.id, 'vpc_id': vpc.id}
-                    )
-                    old_rt = [ x for x in old_rt if x.id != None ]
-                    if len(old_rt) == 1:
-                        old_rt = old_rt[0]
-                        association_id = None
-                        for a in old_rt.associations:
-                            if a.subnet_id == rsn.id:
-                                association_id = a.id
-                        vpc_conn.disassociate_route_table(association_id)
-
-                    vpc_conn.associate_route_table(new_rt.id, rsn.id)
-
-                all_route_tables.append(new_rt)
-                changed = True
-            except EC2ResponseError, e:
-                module.fail_json(
-                    msg='Unable to create and associate route table {0}, error: ' \
-                    '{1}'.format(rt, e)
-                )
-
-        # Now that we are good to go on our new route tables, delete the
-        # old ones except the 'main' route table as boto can't set the main
-        # table yet.
-        all_rts = vpc_conn.get_all_route_tables(filters={'vpc-id': vpc.id})
-        for rt in all_rts:
-            if rt.id is None:
-                continue
-            delete_rt = True
-            for newrt in all_route_tables:
-                if newrt.id == rt.id:
-                    delete_rt = False
-                    break
-            if delete_rt:
-                rta = rt.associations
-                is_main = False
-                for a in rta:
-                    if a.main:
-                        is_main = True
-                        break
-                try:
-                    if not is_main:
-                        vpc_conn.delete_route_table(rt.id)
-                        changed = True
-                except EC2ResponseError, e:
-                    module.fail_json(msg='Unable to delete old route table {0}, error: {1}'.format(rt.id, e))
-
     vpc_dict = get_vpc_info(vpc)
     created_vpc_id = vpc.id
     returned_subnets = []
@@ -509,7 +415,109 @@ def create_vpc(module, vpc_conn):
             'id': sn.id,
         })
 
+    if module.params.get('route_tables_enabled') == True:
+        create_route_tables(module, vpc_conn, vpc, internet_gateway, igw)
+
     return (vpc_dict, created_vpc_id, returned_subnets, changed)
+
+def create_route_tables(module, vpc_conn, vpc, internet_gateway, igw):
+    # Handle route tables - this may be worth splitting into a
+    # different module but should work fine here. The strategy to stay
+    # indempotent is to basically build all the route tables as
+    # defined, track the route table ids, and then run through the
+    # remote list of route tables and delete any that we didn't
+    # create.  This shouldn't interrupt traffic in theory, but is the
+    # only way to really work with route tables over time that I can
+    # think of without using painful aws ids.  Hopefully boto will add
+    # the replace-route-table API to make this smoother and
+    # allow control of the 'main' routing table.
+
+    route_tables = module.params.get('route_tables')
+    if route_tables is None:
+        return
+
+    if not isinstance(route_tables, list):
+        module.fail_json(msg='route tables need to be a list of dictionaries')
+
+    # Work through each route table and update/create to match dictionary array
+    all_route_tables = []
+    for rt in route_tables:
+        try:
+            new_rt = vpc_conn.create_route_table(vpc.id)
+            for route in rt['routes']:
+                route_kwargs = {}
+                if route['gw'] == 'igw':
+                    if not internet_gateway:
+                        module.fail_json(
+                            msg='You asked for an Internet Gateway ' \
+                            '(igw) route, but you have no Internet Gateway'
+                        )
+                    route_kwargs['gateway_id'] = igw.id
+                elif route['gw'].startswith('i-'):
+                    route_kwargs['instance_id'] = route['gw']
+                else:
+                    route_kwargs['gateway_id'] = route['gw']
+                vpc_conn.create_route(new_rt.id, route['dest'], **route_kwargs)
+
+            # Associate with subnets
+            for sn in rt['subnets']:
+                rsn = vpc_conn.get_all_subnets(filters={'cidr': sn, 'vpc_id': vpc.id })
+                if len(rsn) != 1:
+                    module.fail_json(
+                        msg='The subnet {0} to associate with route_table {1} ' \
+                        'does not exist, aborting'.format(sn, rt)
+                    )
+                rsn = rsn[0]
+
+                # Disassociate then associate since we don't have replace
+                old_rt = vpc_conn.get_all_route_tables(
+                    filters={'association.subnet_id': rsn.id, 'vpc_id': vpc.id}
+                )
+                old_rt = [ x for x in old_rt if x.id != None ]
+                if len(old_rt) == 1:
+                    old_rt = old_rt[0]
+                    association_id = None
+                    for a in old_rt.associations:
+                        if a.subnet_id == rsn.id:
+                            association_id = a.id
+                    vpc_conn.disassociate_route_table(association_id)
+
+                vpc_conn.associate_route_table(new_rt.id, rsn.id)
+
+            all_route_tables.append(new_rt)
+            changed = True
+        except EC2ResponseError, e:
+            module.fail_json(
+                msg='Unable to create and associate route table {0}, error: ' \
+                '{1}'.format(rt, e)
+            )
+
+    # Now that we are good to go on our new route tables, delete the
+    # old ones except the 'main' route table as boto can't set the main
+    # table yet.
+    all_rts = vpc_conn.get_all_route_tables(filters={'vpc-id': vpc.id})
+    for rt in all_rts:
+        if rt.id is None:
+            continue
+        delete_rt = True
+        for newrt in all_route_tables:
+            if newrt.id == rt.id:
+                delete_rt = False
+                break
+        if delete_rt:
+            rta = rt.associations
+            is_main = False
+            for a in rta:
+                if a.main:
+                    is_main = True
+                    break
+            try:
+                if not is_main:
+                    vpc_conn.delete_route_table(rt.id)
+                    changed = True
+            except EC2ResponseError, e:
+                module.fail_json(msg='Unable to delete old route table {0}, error: {1}'.format(rt.id, e))
+
 
 def terminate_vpc(module, vpc_conn, vpc_id=None, cidr=None):
     """
@@ -584,6 +592,7 @@ def main():
             resource_tags = dict(type='dict', required=True),
             route_tables = dict(type='list'),
             state = dict(choices=['present', 'absent'], default='present'),
+            route_tables_enabled = dict(type='bool', default=True),
         )
     )
 

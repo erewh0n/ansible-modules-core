@@ -373,8 +373,11 @@ def main():
         # Compare the remote MD5 sum of the object with the local dest md5sum, if it already exists. 
         if pathrtn is True:
             md5_remote = keysum(module, s3, bucket, obj)
-            md5_local = hashlib.md5(open(dest, 'rb').read()).hexdigest()
-            if md5_local == md5_remote:
+            f = open(dest, 'rb')
+            md5_local = hashlib.md5()
+            for chunk in iter(lambda: f.read(65536), ''):
+                md5_local.update(chunk)
+            if md5_local.hexdigest() == md5_remote:
                 sum_matches = True
                 if overwrite is True:
                     download_s3file(module, s3, bucket, obj, dest)
@@ -417,8 +420,11 @@ def main():
         # Lets check key state. Does it exist and if it does, compute the etag md5sum.
         if bucketrtn is True and keyrtn is True:
                 md5_remote = keysum(module, s3, bucket, obj)
-                md5_local = hashlib.md5(open(src, 'rb').read()).hexdigest()
-                if md5_local == md5_remote:
+                f = open(src, 'rb')
+                md5_local = hashlib.md5()
+                for chunk in iter(lambda: f.read(65536), ''):
+                    md5_local.update(chunk)
+                if md5_local.hexdigest() == md5_remote:
                     sum_matches = True
                     if overwrite is True:
                         upload_s3file(module, s3, bucket, obj, src, expiry, metadata)

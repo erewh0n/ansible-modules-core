@@ -199,7 +199,7 @@ except ImportError:
 ASG_ATTRIBUTES = ('availability_zones', 'default_cooldown', 'desired_capacity',
     'health_check_period', 'health_check_type', 'launch_config_name',
     'load_balancers', 'max_size', 'min_size', 'name', 'placement_group',
-    'tags', 'termination_policies', 'vpc_zone_identifier')
+    'termination_policies', 'vpc_zone_identifier')
 
 INSTANCE_ATTRIBUTES = ('instance_id', 'health_status', 'lifecycle_state', 'launch_config_name')
 
@@ -245,6 +245,10 @@ def get_properties(autoscaling_group):
                 properties['pending_instances'] += 1
         properties['instance_facts'] = instance_facts
     properties['load_balancers'] = autoscaling_group.load_balancers
+
+    if hasattr(autoscaling_group, "tags"):
+        properties['tags'] = dict((t.key, t.value) for t in autoscaling_group.tags)
+
     return properties
 
 
@@ -357,6 +361,7 @@ def create_autoscaling_group(connection, module):
                                 continue
             if changed:
                 connection.create_or_update_tags(asg_tags)
+                as_group.tags = asg_tags
 
         # handle loadbalancers separately because None != []
         load_balancers = module.params.get('load_balancers') or []
@@ -371,26 +376,6 @@ def create_autoscaling_group(connection, module):
             return(changed, asg_properties)
         except BotoServerError, e:
             module.fail_json(msg=str(e))
-
-
-    result = as_groups[0]
-    module.exit_json(changed=changed, name=result.name,
-        autoscaling_group_arn=result.autoscaling_group_arn,
-        availability_zones=result.availability_zones,
-        created_time=str(result.created_time),
-        default_cooldown=result.default_cooldown,
-        health_check_period=result.health_check_period,
-        health_check_type=result.health_check_type,
-        instance_id=result.instance_id,
-        instances=[instance.instance_id for instance in result.instances],
-        launch_config_name=result.launch_config_name,
-        load_balancers=result.load_balancers,
-        min_size=result.min_size, max_size=result.max_size,
-        placement_group=result.placement_group,
-        wait_timeout = dict(default=300),
-        tags=result.tags,
-        termination_policies=result.termination_policies,
-        vpc_zone_identifier=result.vpc_zone_identifier)
 
 
 def delete_autoscaling_group(connection, module):
@@ -577,9 +562,13 @@ def main():
             tags=dict(type='list', default=[]),
             health_check_period=dict(type='int', default=300),
             health_check_type=dict(default='EC2', choices=['EC2', 'ELB']),
-        )
+        ),
     )
-    module = AnsibleModule(argument_spec=argument_spec)
+    
+    module = AnsibleModule(
+        argument_spec=argument_spec, 
+        mutually_exclusive = [['replace_all_instances', 'replace_instances']]
+    )
 
     state = module.params.get('state')
     replace_instances = module.params.get('replace_instances')
@@ -592,15 +581,15 @@ def main():
     except boto.exception.NoAuthHandlerFound, e:
         module.fail_json(msg=str(e))
     changed = create_changed = replace_changed = False
-    if replace_all_instances and replace_instances:
-        module.fail_json(msg="You can't use replace_instances and replace_all_instances in the same task.")
+    
+
     if state == 'present':
         create_changed, asg_properties=create_autoscaling_group(connection, module)
-    if replace_all_instances or replace_instances:
-        replace_changed, asg_properties=replace(connection, module)
     elif state == 'absent':
        changed = delete_autoscaling_group(connection, module)
        module.exit_json( changed = changed )
+    if replace_all_instances or replace_instances:
+        replace_changed, asg_properties=replace(connection, module)
     if create_changed or replace_changed:
         changed = True
     module.exit_json( changed = changed, **asg_properties )
